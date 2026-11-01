@@ -10,6 +10,8 @@
       <a href="{{ url_for('hello') }}">HelpDesk</a>
       {% if current_user %}
         <span>Signed in as {{ current_user }}</span>
+        <a href="{{ url_for('tickets') }}">Tickets</a>
+        <a href="{{ url_for('new_ticket') }}">New ticket</a>
         <form method="post" action="{{ url_for('logout') }}">
           <button type="submit">Log out</button>
         </form>

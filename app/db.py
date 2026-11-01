@@ -36,6 +36,31 @@ def fetch_one(query: str, params: tuple[object, ...] = ()) -> dict[str, object] 
             return dict(zip(columns, row))
 
 
+def fetch_all(query: str, params: tuple[object, ...] = ()) -> list[dict[str, object]]:
+    with get_db_connection() as conn:
+        with conn.cursor() as cursor:
+            cursor.execute(query, params)
+            rows = cursor.fetchall()
+            description = cursor.description
+            if description is None:
+                raise RuntimeError("Database query did not return columns")
+            columns = [column.name for column in description]
+            return [dict(zip(columns, row)) for row in rows]
+
+
+def execute_returning(query: str, params: tuple[object, ...] = ()) -> dict[str, object]:
+    with get_db_connection() as conn:
+        with conn.cursor() as cursor:
+            cursor.execute(query, params)
+            row = cursor.fetchone()
+            description = cursor.description
+            if row is None or description is None:
+                raise RuntimeError("Database query did not return a row")
+            columns = [column.name for column in description]
+        conn.commit()
+        return dict(zip(columns, row))
+
+
 def execute(query: str, params: tuple[object, ...] = ()) -> None:
     with get_db_connection() as conn:
         with conn.cursor() as cursor:

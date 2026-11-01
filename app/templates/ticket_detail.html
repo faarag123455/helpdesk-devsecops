@@ -1,0 +1,39 @@
+{% extends "base.html" %}
+{% block title %}{{ ticket.title }} - HelpDesk{% endblock %}
+{% block content %}
+<h1>{{ ticket.title }}</h1>
+<p>Status: {{ ticket.status }} | Priority: {{ ticket.priority }}</p>
+<p>Created by {{ ticket.creator }}</p>
+<p>{{ ticket.description }}</p>
+
+<h2>Comments</h2>
+{% for comment in comments %}
+  <article>
+    <strong>{{ comment.username }}</strong>
+    <time>{{ comment.created_at }}</time>
+    {# VULN-2: Stored XSS - comments are rendered as trusted HTML. #}
+    <p>{{ comment.body|safe }}</p>
+  </article>
+{% else %}
+  <p>No comments yet.</p>
+{% endfor %}
+
+{% if session.role in ['user', 'agent', 'admin'] %}
+<form method="post" action="{{ url_for('add_comment', ticket_id=ticket.id) }}">
+  <label for="body">Add a comment</label>
+  <textarea id="body" name="body" required></textarea>
+  <button type="submit">Comment</button>
+</form>
+{% endif %}
+
+{% if session.role in ['agent', 'admin'] %}
+<form method="post" action="{{ url_for('assign_ticket', ticket_id=ticket.id) }}">
+  <label for="assignee_id">Assign to user ID</label>
+  <input id="assignee_id" name="assignee_id" type="number" required>
+  <button type="submit">Assign</button>
+</form>
+<form method="post" action="{{ url_for('close_ticket', ticket_id=ticket.id) }}">
+  <button type="submit">Close ticket</button>
+</form>
+{% endif %}
+{% endblock %}

@@ -1,11 +1,11 @@
 from functools import wraps
 from typing import Callable, TypeVar
 
-from flask import Flask, flash, redirect, render_template, request, session, url_for
+from flask import Flask, abort, flash, redirect, render_template, request, session, url_for
 from werkzeug.security import check_password_hash, generate_password_hash
 
 from config import Config
-from db import execute, fetch_one
+from db import execute, execute_returning, fetch_all, fetch_one
 
 ViewFunction = TypeVar("ViewFunction", bound=Callable[..., object])
 
@@ -42,6 +42,9 @@ def create_app() -> Flask:
             return wrapped_view  # type: ignore[return-value]
 
         return decorator
+
+    def can_manage_ticket(ticket: dict[str, object]) -> bool:
+        return session.get("role") in {"agent", "admin"} or ticket["created_by"] == session["user_id"]
 
     @app.get("/")
     def hello() -> str:
@@ -114,6 +117,133 @@ def create_app() -> Flask:
     @role_required("admin")
     def admin_home() -> str:
         return "Admin area"
+
+    @app.get("/tickets")
+    @login_required
+    def tickets() -> str:
+        if session.get("role") in {"agent", "admin"}:
+            ticket_rows = fetch_all(
+                """
+                SELECT t.id, t.title, t.status, t.priority, t.created_at,
+                       u.username AS creator, a.username AS assignee
+                FROM tickets t
+                JOIN users u ON u.id = t.created_by
+                LEFT JOIN users a ON a.id = t.assigned_to
+                ORDER BY t.created_at DESC
+                """
+            )
+        else:
+            ticket_rows = fetch_all(
+                """
+                SELECT t.id, t.title, t.status, t.priority, t.created_at,
+                       u.username AS creator, a.username AS assignee
+                FROM tickets t
+                JOIN users u ON u.id = t.created_by
+                LEFT JOIN users a ON a.id = t.assigned_to
+                WHERE t.created_by = %s
+                ORDER BY t.created_at DESC
+                """,
+                (session["user_id"],),
+            )
+        return render_template("tickets.html", tickets=ticket_rows)
+
+    @app.route("/tickets/new", methods=["GET", "POST"])
+    @login_required
+    def new_ticket() -> str:
+        if request.method == "POST":
+            title = request.form.get("title", "").strip()
+            description = request.form.get("description", "").strip()
+            priority = request.form.get("priority", "medium")
+            if not title or not description or priority not in {"low", "medium", "high"}:
+                flash("Title, description, and a valid priority are required.", "error")
+                return render_template("new_ticket.html"), 400
+
+            ticket = execute_returning(
+                """
+                INSERT INTO tickets (title, description, priority, created_by)
+                VALUES (%s, %s, %s, %s)
+                RETURNING id
+                """,
+                (title, description, priority, session["user_id"]),
+            )
+            flash("Ticket created.", "success")
+            return redirect(url_for("ticket_detail", ticket_id=ticket["id"]))
+        return render_template("new_ticket.html")
+
+    @app.get("/tickets/<int:ticket_id>")
+    @login_required
+    def ticket_detail(ticket_id: int) -> str:
+        # VULN-3: IDOR - ticket ownership is not checked on detail access.
+        ticket = fetch_one(
+            """
+            SELECT t.id, t.title, t.description, t.status, t.priority, t.created_at,
+                   t.created_by, u.username AS creator, a.username AS assignee
+            FROM tickets t
+            JOIN users u ON u.id = t.created_by
+            LEFT JOIN users a ON a.id = t.assigned_to
+            WHERE t.id = %s
+            """,
+            (ticket_id,),
+        )
+        if ticket is None:
+            abort(404)
+        comments = fetch_all(
+            """
+            SELECT c.id, c.body, c.created_at, u.username
+            FROM comments c
+            JOIN users u ON u.id = c.user_id
+            WHERE c.ticket_id = %s
+            ORDER BY c.created_at ASC
+            """,
+            (ticket_id,),
+        )
+        return render_template("ticket_detail.html", ticket=ticket, comments=comments)
+
+    @app.post("/tickets/<int:ticket_id>/comment")
+    @login_required
+    def add_comment(ticket_id: int) -> object:
+        ticket = fetch_one("SELECT id, created_by FROM tickets WHERE id = %s", (ticket_id,))
+        if ticket is None:
+            abort(404)
+        if not can_manage_ticket(ticket):
+            return "Forbidden", 403
+        body = request.form.get("body", "").strip()
+        if not body:
+            flash("Comment cannot be empty.", "error")
+            return redirect(url_for("ticket_detail", ticket_id=ticket_id))
+        execute(
+            "INSERT INTO comments (ticket_id, user_id, body) VALUES (%s, %s, %s)",
+            (ticket_id, session["user_id"], body),
+        )
+        flash("Comment added.", "success")
+        return redirect(url_for("ticket_detail", ticket_id=ticket_id))
+
+    @app.post("/tickets/<int:ticket_id>/assign")
+    @role_required("agent", "admin")
+    def assign_ticket(ticket_id: int) -> object:
+        assignee_id = request.form.get("assignee_id", type=int)
+        if assignee_id is None:
+            return "A valid assignee is required", 400
+        if fetch_one("SELECT id FROM tickets WHERE id = %s", (ticket_id,)) is None:
+            abort(404)
+        assignee = fetch_one(
+            "SELECT id FROM users WHERE id = %s AND role IN ('agent', 'admin')",
+            (assignee_id,),
+        )
+        if assignee is None:
+            return "Invalid assignee", 400
+        execute("UPDATE tickets SET assigned_to = %s WHERE id = %s", (assignee_id, ticket_id))
+        flash("Ticket assigned.", "success")
+        return redirect(url_for("ticket_detail", ticket_id=ticket_id))
+
+    @app.post("/tickets/<int:ticket_id>/close")
+    @role_required("agent", "admin")
+    def close_ticket(ticket_id: int) -> object:
+        if fetch_one("SELECT id FROM tickets WHERE id = %s", (ticket_id,)) is None:
+            abort(404)
+        execute("UPDATE tickets SET status = 'closed' WHERE id = %s", (ticket_id,))
+        flash("Ticket closed.", "success")
+        return redirect(url_for("ticket_detail", ticket_id=ticket_id))
 
     return app
 

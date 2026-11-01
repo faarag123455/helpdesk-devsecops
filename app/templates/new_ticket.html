@@ -1,0 +1,18 @@
+{% extends "base.html" %}
+{% block title %}New ticket - HelpDesk{% endblock %}
+{% block content %}
+<h1>New ticket</h1>
+<form method="post">
+  <label for="title">Title</label>
+  <input id="title" name="title" maxlength="200" required>
+  <label for="description">Description</label>
+  <textarea id="description" name="description" required></textarea>
+  <label for="priority">Priority</label>
+  <select id="priority" name="priority">
+    <option value="low">Low</option>
+    <option value="medium" selected>Medium</option>
+    <option value="high">High</option>
+  </select>
+  <button type="submit">Create ticket</button>
+</form>
+{% endblock %}
