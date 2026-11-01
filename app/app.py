@@ -1,4 +1,5 @@
 from functools import wraps
+import os
 from typing import Callable, TypeVar
 
 from flask import Flask, abort, flash, redirect, render_template, request, session, url_for
@@ -252,4 +253,4 @@ app = create_app()
 
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=5000)
+    app.run(host=os.environ.get("FLASK_HOST", "127.0.0.1"), port=5000)
