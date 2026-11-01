@@ -48,8 +48,10 @@ def create_app() -> Flask:
         return session.get("role") in {"agent", "admin"} or ticket["created_by"] == session["user_id"]
 
     @app.get("/")
-    def hello() -> str:
-        return render_template("hello.html")
+    def hello() -> object:
+        if "user_id" in session:
+            return redirect(url_for("tickets"))
+        return redirect(url_for("login"))
 
     @app.route("/register", methods=["GET", "POST"])
     def register() -> str:
@@ -112,12 +114,12 @@ def create_app() -> Flask:
     @app.get("/agent")
     @role_required("agent", "admin")
     def agent_home() -> str:
-        return "Agent area"
+        return render_template("status.html", heading="Agent area", message="Manage and resolve customer tickets.")
 
     @app.get("/admin")
     @role_required("admin")
     def admin_home() -> str:
-        return "Admin area"
+        return render_template("status.html", heading="Admin area", message="Manage HelpDesk users and access.")
 
     @app.get("/tickets")
     @login_required

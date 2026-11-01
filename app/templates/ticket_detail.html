@@ -1,39 +1,55 @@
 {% extends "base.html" %}
 {% block title %}{{ ticket.title }} - HelpDesk{% endblock %}
 {% block content %}
-<h1>{{ ticket.title }}</h1>
-<p>Status: {{ ticket.status }} | Priority: {{ ticket.priority }}</p>
-<p>Created by {{ ticket.creator }}</p>
-<p>{{ ticket.description }}</p>
-
-<h2>Comments</h2>
-{% for comment in comments %}
-  <article>
-    <strong>{{ comment.username }}</strong>
-    <time>{{ comment.created_at }}</time>
-    {# VULN-2: Stored XSS - comments are rendered as trusted HTML. #}
-    <p>{{ comment.body|safe }}</p>
+<a class="back-link" href="{{ url_for('tickets') }}">← Back to tickets</a>
+<section class="detail-layout">
+  <article class="card ticket-detail">
+    <div class="ticket-card-top">
+      <span class="status status-{{ ticket.status }}">{{ ticket.status }}</span>
+      <span class="priority priority-{{ ticket.priority }}">{{ ticket.priority }} priority</span>
+    </div>
+    <h1>{{ ticket.title }}</h1>
+    <p class="muted">Created by {{ ticket.creator }}</p>
+    <div class="description">{{ ticket.description }}</div>
   </article>
-{% else %}
-  <p>No comments yet.</p>
-{% endfor %}
+  <aside class="card side-panel">
+    <h2>Ticket details</h2>
+    <p><span class="detail-label">Status</span>{{ ticket.status }}</p>
+    <p><span class="detail-label">Priority</span>{{ ticket.priority }}</p>
+    <p><span class="detail-label">Assignee</span>{{ ticket.assignee or "Unassigned" }}</p>
+    {% if session.role in ['agent', 'admin'] %}
+    <form method="post" action="{{ url_for('assign_ticket', ticket_id=ticket.id) }}">
+      <label for="assignee_id">Assign to user ID</label>
+      <input id="assignee_id" name="assignee_id" type="number" required>
+      <button class="button button-secondary" type="submit">Assign ticket</button>
+    </form>
+    <form method="post" action="{{ url_for('close_ticket', ticket_id=ticket.id) }}">
+      <button class="button button-danger" type="submit">Close ticket</button>
+    </form>
+    {% endif %}
+  </aside>
+</section>
 
-{% if session.role in ['user', 'agent', 'admin'] %}
-<form method="post" action="{{ url_for('add_comment', ticket_id=ticket.id) }}">
-  <label for="body">Add a comment</label>
-  <textarea id="body" name="body" required></textarea>
-  <button type="submit">Comment</button>
-</form>
-{% endif %}
-
-{% if session.role in ['agent', 'admin'] %}
-<form method="post" action="{{ url_for('assign_ticket', ticket_id=ticket.id) }}">
-  <label for="assignee_id">Assign to user ID</label>
-  <input id="assignee_id" name="assignee_id" type="number" required>
-  <button type="submit">Assign</button>
-</form>
-<form method="post" action="{{ url_for('close_ticket', ticket_id=ticket.id) }}">
-  <button type="submit">Close ticket</button>
-</form>
-{% endif %}
+<section class="comments-section">
+  <div class="section-heading">
+    <h2>Conversation</h2>
+    <span class="muted">{{ comments|length }} comments</span>
+  </div>
+  {% for comment in comments %}
+    <article class="comment card">
+      <div class="comment-meta"><strong>{{ comment.username }}</strong><time>{{ comment.created_at }}</time></div>
+      {# VULN-2: Stored XSS - comments are rendered as trusted HTML. #}
+      <p>{{ comment.body|safe }}</p>
+    </article>
+  {% else %}
+    <div class="card empty-state compact"><p class="muted">No comments yet.</p></div>
+  {% endfor %}
+  {% if session.role in ['user', 'agent', 'admin'] %}
+  <form class="card form-card comment-form" method="post" action="{{ url_for('add_comment', ticket_id=ticket.id) }}">
+    <label for="body">Add a comment</label>
+    <textarea id="body" name="body" placeholder="Write an update..." required></textarea>
+    <button class="button button-primary" type="submit">Post comment</button>
+  </form>
+  {% endif %}
+</section>
 {% endblock %}

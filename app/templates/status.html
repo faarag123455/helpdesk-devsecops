@@ -1,0 +1,10 @@
+{% extends "base.html" %}
+{% block title %}{{ heading }} - HelpDesk{% endblock %}
+{% block content %}
+<section class="card empty-state">
+  <p class="eyebrow">HELPDESK</p>
+  <h1>{{ heading }}</h1>
+  <p class="muted">{{ message }}</p>
+  <a class="button button-primary" href="{{ url_for('tickets') }}">View tickets</a>
+</section>
+{% endblock %}
