@@ -10,5 +10,24 @@ services:
     volumes:
       - helpdesk_postgres_data:/var/lib/postgresql/data
 
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: helpdesk-app:latest
+    environment:
+      FLASK_HOST: 0.0.0.0
+      FLASK_DEBUG: "1"
+      SECRET_KEY: local-development-secret
+      DB_HOST: postgres
+      DB_PORT: "5432"
+      DB_NAME: helpdesk
+      DB_USER: helpdesk
+      DB_PASSWORD: fake-db-password-123
+    ports:
+      - "127.0.0.1:5000:5000"
+    depends_on:
+      - postgres
+
 volumes:
   helpdesk_postgres_data:
