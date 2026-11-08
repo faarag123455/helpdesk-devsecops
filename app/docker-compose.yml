@@ -4,7 +4,7 @@ services:
     environment:
       POSTGRES_DB: helpdesk
       POSTGRES_USER: helpdesk
-      POSTGRES_PASSWORD: helpdesk
+      POSTGRES_PASSWORD: fake-db-password-123
     ports:
       - "127.0.0.1:5432:5432"
     volumes:

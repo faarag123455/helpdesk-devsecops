@@ -9,6 +9,26 @@
   </div>
   <a class="button button-primary" href="{{ url_for('new_ticket') }}">+ New ticket</a>
 </header>
+<section class="card form-card">
+  <h2>Save filter preset</h2>
+  <form method="post" action="{{ url_for('save_preset') }}">
+    <label for="status">Status</label>
+    <select id="status" name="status">
+      <option value="">Any status</option>
+      <option value="open">Open</option>
+      <option value="closed">Closed</option>
+    </select>
+    <label for="priority">Priority</label>
+    <select id="priority" name="priority">
+      <option value="">Any priority</option>
+      <option value="low">Low</option>
+      <option value="medium">Medium</option>
+      <option value="high">High</option>
+    </select>
+    <button class="button button-secondary" type="submit">Save preset</button>
+  </form>
+  <p class="form-footer"><a href="{{ url_for('load_preset') }}">Load saved preset</a></p>
+</section>
 {% if tickets %}
 <section class="ticket-grid">
   {% for ticket in tickets %}

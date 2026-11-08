@@ -11,6 +11,7 @@
     <h1>{{ ticket.title }}</h1>
     <p class="muted">Created by {{ ticket.creator }}</p>
     <div class="description">{{ ticket.description }}</div>
+    <a class="button button-secondary" href="{{ url_for('ticket_preview', ticket_id=ticket.id) }}">Preview template</a>
   </article>
   <aside class="card side-panel">
     <h2>Ticket details</h2>
@@ -44,11 +45,25 @@
   {% else %}
     <div class="card empty-state compact"><p class="muted">No comments yet.</p></div>
   {% endfor %}
+  <h2>Attached links</h2>
+  {% for attachment in attachments %}
+    <article class="comment card">
+      <div class="comment-meta"><strong>{{ attachment.source_url }}</strong><time>{{ attachment.created_at }}</time></div>
+      <p>{{ attachment.content }}</p>
+    </article>
+  {% else %}
+    <div class="card empty-state compact"><p class="muted">No links attached yet.</p></div>
+  {% endfor %}
   {% if session.role in ['user', 'agent', 'admin'] %}
   <form class="card form-card comment-form" method="post" action="{{ url_for('add_comment', ticket_id=ticket.id) }}">
     <label for="body">Add a comment</label>
     <textarea id="body" name="body" placeholder="Write an update..." required></textarea>
     <button class="button button-primary" type="submit">Post comment</button>
+  </form>
+  <form class="card form-card comment-form" method="post" action="{{ url_for('attach_url', ticket_id=ticket.id) }}">
+    <label for="url">Attach a link</label>
+    <input id="url" name="url" type="url" placeholder="https://example.com" required>
+    <button class="button button-secondary" type="submit">Attach link</button>
   </form>
   {% endif %}
 </section>

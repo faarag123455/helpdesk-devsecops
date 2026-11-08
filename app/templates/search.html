@@ -1,0 +1,31 @@
+{% extends "base.html" %}
+{% block title %}Search - HelpDesk{% endblock %}
+{% block content %}
+<header class="page-header">
+  <div>
+    <p class="eyebrow">WORKSPACE</p>
+    <h1>Search tickets</h1>
+  </div>
+</header>
+<form class="card form-card" method="get">
+  <label for="q">Search by title</label>
+  <input id="q" name="q" value="{{ query }}" placeholder="Try billing or access">
+  <button class="button button-primary" type="submit">Search</button>
+</form>
+{% if query %}
+  <section class="ticket-grid">
+    {% for ticket in tickets %}
+      <a class="card ticket-card" href="{{ url_for('ticket_detail', ticket_id=ticket.id) }}">
+        <div class="ticket-card-top">
+          <span class="status status-{{ ticket.status }}">{{ ticket.status }}</span>
+          <span class="priority priority-{{ ticket.priority }}">{{ ticket.priority }}</span>
+        </div>
+        <h2>{{ ticket.title }}</h2>
+        <p class="muted">Created by {{ ticket.creator }}</p>
+      </a>
+    {% else %}
+      <p class="muted">No matching tickets.</p>
+    {% endfor %}
+  </section>
+{% endif %}
+{% endblock %}

@@ -1,0 +1,21 @@
+{% extends "base.html" %}
+{% block title %}Preview ticket - HelpDesk{% endblock %}
+{% block content %}
+<div class="narrow-layout">
+  <a class="back-link" href="{{ url_for('ticket_detail', ticket_id=ticket.id) }}">← Back to ticket</a>
+  <p class="eyebrow">CUSTOM PREVIEW</p>
+  <h1>Preview ticket</h1>
+  <p class="muted">Enter a template snippet to customize the ticket summary.</p>
+  <form class="card form-card" method="post">
+    <label for="template">Template</label>
+    <textarea id="template" name="template" placeholder="Ticket: {{ ticket.title }}">{{ template_text }}</textarea>
+    <button class="button button-primary" type="submit">Render preview</button>
+  </form>
+  {% if rendered_output %}
+    <section class="card form-card">
+      <h2>Rendered output</h2>
+      <div>{{ rendered_output|safe }}</div>
+    </section>
+  {% endif %}
+</div>
+{% endblock %}

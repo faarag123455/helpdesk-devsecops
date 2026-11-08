@@ -39,7 +39,10 @@ def fetch_one(query: str, params: tuple[object, ...] = ()) -> dict[str, object] 
 def fetch_all(query: str, params: tuple[object, ...] = ()) -> list[dict[str, object]]:
     with get_db_connection() as conn:
         with conn.cursor() as cursor:
-            cursor.execute(query, params)
+            if params:
+                cursor.execute(query, params)
+            else:
+                cursor.execute(query)
             rows = cursor.fetchall()
             description = cursor.description
             if description is None:

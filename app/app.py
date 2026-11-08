@@ -1,8 +1,24 @@
+import base64
 from functools import wraps
 import os
+import pickle
+import subprocess
+from datetime import datetime
 from typing import Callable, TypeVar
+from urllib.request import urlopen
 
-from flask import Flask, abort, flash, redirect, render_template, request, session, url_for
+from flask import (
+    Flask,
+    abort,
+    flash,
+    make_response,
+    redirect,
+    render_template,
+    render_template_string,
+    request,
+    session,
+    url_for,
+)
 from werkzeug.security import check_password_hash, generate_password_hash
 
 from config import Config
@@ -14,6 +30,19 @@ ViewFunction = TypeVar("ViewFunction", bound=Callable[..., object])
 def create_app() -> Flask:
     app = Flask(__name__)
     app.config.from_object(Config)
+
+    @app.after_request
+    def log_request(response: object) -> object:
+        username = session.get("username", "anonymous")
+        app.logger.info(
+            "request timestamp=%s method=%s path=%s status=%s username=%s",
+            datetime.now().isoformat(),
+            request.method,
+            request.path,
+            getattr(response, "status_code", "unknown"),
+            username,
+        )
+        return response
 
     @app.context_processor
     def inject_current_user() -> dict[str, object]:
@@ -121,6 +150,87 @@ def create_app() -> Flask:
     def admin_home() -> str:
         return render_template("status.html", heading="Admin area", message="Manage HelpDesk users and access.")
 
+    @app.route("/search")
+    @login_required
+    def search() -> str:
+        query_text = request.args.get("q", "")
+        app.logger.info("search query=%s", query_text)
+        # VULN-1: SQL injection - the search input is interpolated into SQL.
+        visibility = (
+            ""
+            if session.get("role") in {"agent", "admin"}
+            else f"AND t.created_by = {session['user_id']}"
+        )
+        query = f"""
+            SELECT t.id, t.title, t.status, t.priority, t.created_at,
+                   u.username AS creator
+            FROM tickets t
+            JOIN users u ON u.id = t.created_by
+            WHERE t.title ILIKE '%{query_text}%' {visibility}
+            ORDER BY t.created_at DESC
+        """
+        results = fetch_all(query)
+        return render_template("search.html", tickets=results, query=query_text)
+
+    @app.route("/admin/users")
+    @login_required
+    def admin_users() -> str:
+        # VULN-4: Privilege escalation - only login is checked, not admin role.
+        users = fetch_all(
+            "SELECT id, username, email, role, created_at FROM users ORDER BY id"
+        )
+        return render_template("admin_users.html", users=users)
+
+    @app.post("/admin/users/<int:user_id>/role")
+    @login_required
+    def update_user_role(user_id: int) -> object:
+        # VULN-4: Privilege escalation - only login is checked, not admin role.
+        role = request.form.get("role", "")
+        if role not in {"user", "agent", "admin"}:
+            return "Invalid role", 400
+        if fetch_one("SELECT id FROM users WHERE id = %s", (user_id,)) is None:
+            abort(404)
+        execute("UPDATE users SET role = %s WHERE id = %s", (role, user_id))
+        flash("User role updated.", "success")
+        return redirect(url_for("admin_users"))
+
+    @app.route("/admin/diagnostics", methods=["GET", "POST"])
+    @login_required
+    def diagnostics() -> str:
+        output = ""
+        host = ""
+        if request.method == "POST":
+            host = request.form.get("host", "")
+            app.logger.info("diagnostics host=%s", host)
+            ping_flag = "-n" if os.name == "nt" else "-c"
+            # VULN-8: OS command injection through shell=True and interpolated input.
+            command = f"ping {ping_flag} 1 {host}"
+            result = subprocess.run(command, shell=True, capture_output=True, text=True)
+            output = result.stdout + result.stderr
+        return render_template("diagnostics.html", output=output, host=host)
+
+    @app.route("/tickets/<int:ticket_id>/preview", methods=["GET", "POST"])
+    @login_required
+    def ticket_preview(ticket_id: int) -> str:
+        ticket = fetch_one(
+            "SELECT id, title, description, status, priority FROM tickets WHERE id = %s",
+            (ticket_id,),
+        )
+        if ticket is None:
+            abort(404)
+        template_text = request.form.get("template", "") if request.method == "POST" else ""
+        rendered_output = ""
+        if request.method == "POST":
+            app.logger.info("preview template=%s", template_text)
+            # VULN-10: SSTI
+            rendered_output = render_template_string(template_text, ticket=ticket)
+        return render_template(
+            "ticket_preview.html",
+            ticket=ticket,
+            template_text=template_text,
+            rendered_output=rendered_output,
+        )
+
     @app.get("/tickets")
     @login_required
     def tickets() -> str:
@@ -149,6 +259,30 @@ def create_app() -> Flask:
                 (session["user_id"],),
             )
         return render_template("tickets.html", tickets=ticket_rows)
+
+    @app.post("/tickets/save-preset")
+    @login_required
+    def save_preset() -> object:
+        preset = {
+            "status": request.form.get("status", ""),
+            "priority": request.form.get("priority", ""),
+        }
+        encoded_preset = base64.b64encode(pickle.dumps(preset)).decode("ascii")
+        response = make_response(redirect(url_for("tickets")))
+        response.set_cookie("ticket_preset", encoded_preset)
+        flash("Ticket filter preset saved.", "success")
+        return response
+
+    @app.get("/tickets/load-preset")
+    @login_required
+    def load_preset() -> str:
+        encoded_preset = request.cookies.get("ticket_preset", "")
+        preset = None
+        if encoded_preset:
+            # VULN-11: Insecure deserialization (pickle)
+            preset = pickle.loads(base64.b64decode(encoded_preset))
+        app.logger.info("ticket preset loaded username=%s", session.get("username", "anonymous"))
+        return render_template("ticket_preset.html", preset=preset)
 
     @app.route("/tickets/new", methods=["GET", "POST"])
     @login_required
@@ -200,7 +334,21 @@ def create_app() -> Flask:
             """,
             (ticket_id,),
         )
-        return render_template("ticket_detail.html", ticket=ticket, comments=comments)
+        attachments = fetch_all(
+            """
+            SELECT id, source_url, content, created_at
+            FROM attachments
+            WHERE ticket_id = %s
+            ORDER BY created_at ASC
+            """,
+            (ticket_id,),
+        )
+        return render_template(
+            "ticket_detail.html",
+            ticket=ticket,
+            comments=comments,
+            attachments=attachments,
+        )
 
     @app.post("/tickets/<int:ticket_id>/comment")
     @login_required
@@ -248,6 +396,29 @@ def create_app() -> Flask:
         flash("Ticket closed.", "success")
         return redirect(url_for("ticket_detail", ticket_id=ticket_id))
 
+    @app.post("/tickets/<int:ticket_id>/attach-url")
+    @login_required
+    def attach_url(ticket_id: int) -> object:
+        ticket = fetch_one("SELECT id, created_by FROM tickets WHERE id = %s", (ticket_id,))
+        if ticket is None:
+            abort(404)
+        if not can_manage_ticket(ticket):
+            return "Forbidden", 403
+        source_url = request.form.get("url", "")
+        app.logger.info("attach-url url=%s", source_url)
+        # VULN-9: SSRF - fetches an arbitrary URL without scheme or host checks.
+        with urlopen(source_url, timeout=5) as response:
+            content = response.read(20000).decode("utf-8", errors="replace")[:2000]
+        execute(
+            """
+            INSERT INTO attachments (ticket_id, source_url, content)
+            VALUES (%s, %s, %s)
+            """,
+            (ticket_id, source_url, content),
+        )
+        flash("Link attached.", "success")
+        return redirect(url_for("ticket_detail", ticket_id=ticket_id))
+
     return app
 
 
@@ -255,4 +426,6 @@ app = create_app()
 
 
 if __name__ == "__main__":
-    app.run(host=os.environ.get("FLASK_HOST", "127.0.0.1"), port=5000)
+    debug_value = os.environ.get("FLASK_DEBUG", "1").lower() in {"1", "true", "yes", "on"}
+    # VULN-6: Debug mode is enabled by default.
+    app.run(host=os.environ.get("FLASK_HOST", "127.0.0.1"), port=5000, debug=debug_value)

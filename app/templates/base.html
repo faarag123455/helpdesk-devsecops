@@ -16,6 +16,9 @@
         <div class="nav-links">
           <a href="{{ url_for('tickets') }}">Tickets</a>
           <a class="nav-action" href="{{ url_for('new_ticket') }}">New ticket</a>
+          <a href="{{ url_for('search') }}">Search</a>
+          <a href="{{ url_for('admin_users') }}">Users</a>
+          <a href="{{ url_for('diagnostics') }}">Diagnostics</a>
           <span class="user-chip">{{ current_user }}</span>
           <form method="post" action="{{ url_for('logout') }}">
             <button class="button button-ghost" type="submit">Log out</button>

@@ -1,0 +1,20 @@
+{% extends "base.html" %}
+{% block title %}Diagnostics - HelpDesk{% endblock %}
+{% block content %}
+<div class="narrow-layout">
+  <p class="eyebrow">ADMINISTRATION</p>
+  <h1>Diagnostics</h1>
+  <p class="muted">Run a connectivity check from the local HelpDesk server.</p>
+  <form class="card form-card" method="post">
+    <label for="host">Host</label>
+    <input id="host" name="host" value="{{ host }}" placeholder="localhost" required>
+    <button class="button button-primary" type="submit">Run ping</button>
+  </form>
+  {% if output %}
+    <section class="card form-card">
+      <h2>Command output</h2>
+      <pre>{{ output }}</pre>
+    </section>
+  {% endif %}
+</div>
+{% endblock %}

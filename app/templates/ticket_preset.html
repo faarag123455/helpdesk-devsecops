@@ -1,0 +1,15 @@
+{% extends "base.html" %}
+{% block title %}Ticket preset - HelpDesk{% endblock %}
+{% block content %}
+<section class="card empty-state">
+  <p class="eyebrow">TICKET FILTERS</p>
+  <h1>Loaded preset</h1>
+  {% if preset %}
+    <p>Status: <strong>{{ preset.status or "Any" }}</strong></p>
+    <p>Priority: <strong>{{ preset.priority or "Any" }}</strong></p>
+  {% else %}
+    <p class="muted">No saved preset was found.</p>
+  {% endif %}
+  <a class="button button-primary" href="{{ url_for('tickets') }}">Back to tickets</a>
+</section>
+{% endblock %}
