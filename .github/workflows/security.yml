@@ -1,6 +1,10 @@
 # =============================================================================
-# HelpDesk DevSecOps - CI/CD security pipeline (GitHub Actions)
+# HelpDesk DevSecOps - CI/CD security pipeline (GitHub Actions) - version 2
 # TEK-UP, ING-5-SSIRF-B - Owner: Farah Chebbi
+#
+# NEW IN V2: every scanner now saves a JSON report as a downloadable artifact
+# (even when the job fails). These reports are the input for the next steps:
+# security score + badge, and the AI security reviewer.
 #
 # HOW IT WORKS
 #   test, sast, secrets, dependencies -> start immediately, in parallel
@@ -43,7 +47,8 @@ jobs:
 
   # ---------------------------------------------------------------------------
   # 2. sast: Semgrep reads the source code and looks for dangerous patterns
-  #    --error => exit code 1 if something is found (this blocks the pipeline)
+  #    --error       => exit code 1 if something is found (blocks the pipeline)
+  #    --json-output => also saves a machine-readable report
   # ---------------------------------------------------------------------------
   sast:
     runs-on: ubuntu-latest
@@ -58,13 +63,20 @@ jobs:
           --severity ERROR
           --error
           --metrics=off
+          --json-output semgrep-report.json
           app/
+      - name: Save Semgrep report
+        if: always()   # keep the report even when the scan failed
+        uses: actions/upload-artifact@v4
+        with:
+          name: semgrep-report
+          path: semgrep-report.json
+          retention-days: 14
 
   # ---------------------------------------------------------------------------
   # 3. secrets: Gitleaks looks for leaked passwords/keys/tokens
   #    fetch-depth 0 = download the FULL git history (old commits too)
-  #    --config = default rules + our custom "hardcoded credential" rule
-  #    --redact = the secret value is never printed in the log
+  #    --redact = the secret value is never printed in the log or the report
   # ---------------------------------------------------------------------------
   secrets:
     runs-on: ubuntu-latest
@@ -75,10 +87,18 @@ jobs:
       - name: Gitleaks scan
         run: |
           docker run --rm -v "$PWD:/repo" --entrypoint sh zricethezav/gitleaks:v8.21.2 -c \
-            "git config --global --add safe.directory /repo && gitleaks detect --source /repo --config /repo/.gitleaks.toml --redact --verbose --exit-code 1"
+            "git config --global --add safe.directory /repo && gitleaks detect --source /repo --config /repo/.gitleaks.toml --redact --verbose --exit-code 1 --report-format json --report-path /repo/gitleaks-report.json"
+      - name: Save Gitleaks report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: gitleaks-report
+          path: gitleaks-report.json
+          retention-days: 14
 
   # ---------------------------------------------------------------------------
   # 4. dependencies: Trivy checks requirements.txt against public CVE databases
+  #    Step 1 writes the JSON report (never fails), step 2 applies the policy:
   #    --ignore-unfixed => only vulnerabilities that have a fix available
   #    --exit-code 1    => fail on CRITICAL / HIGH findings
   # ---------------------------------------------------------------------------
@@ -86,7 +106,19 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Trivy filesystem scan
+      - name: Trivy JSON report
+        run: |
+          docker run --rm -v "$PWD:/repo" aquasec/trivy:0.58.1 fs \
+            --scanners vuln --severity CRITICAL,HIGH --ignore-unfixed \
+            --format json --output /repo/trivy-deps-report.json \
+            --exit-code 0 --no-progress /repo/app
+      - name: Save Trivy report
+        uses: actions/upload-artifact@v4
+        with:
+          name: trivy-deps-report
+          path: trivy-deps-report.json
+          retention-days: 14
+      - name: Trivy policy check (fails on CRITICAL/HIGH with a fix)
         run: |
           docker run --rm -v "$PWD:/repo" aquasec/trivy:0.58.1 fs \
             --scanners vuln --severity CRITICAL,HIGH --ignore-unfixed \
