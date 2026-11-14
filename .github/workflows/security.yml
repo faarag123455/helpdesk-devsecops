@@ -1,0 +1,136 @@
+# =============================================================================
+# HelpDesk DevSecOps - CI/CD security pipeline (GitHub Actions)
+# TEK-UP, ING-5-SSIRF-B - Owner: Farah Chebbi
+#
+# HOW IT WORKS
+#   test, sast, secrets, dependencies -> start immediately, in parallel
+#   build       -> starts ONLY if all four jobs above passed
+#   image-scan  -> starts ONLY if build passed
+#
+# BLOCKING POLICY (what makes the pipeline fail, and why)
+#   sast         : Semgrep finds an ERROR-level finding in app/
+#   secrets      : Gitleaks finds a secret in the repo or in its full git history
+#                  (value hidden with --redact, only file/rule/line are shown)
+#   dependencies : Trivy finds a CRITICAL/HIGH vulnerability WITH a fix available
+#   image-scan   : same policy as "dependencies", applied to the Docker image
+# =============================================================================
+
+name: HelpDesk security pipeline
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:   # lets you start it by hand from the Actions tab
+
+permissions:
+  contents: read
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # 1. test: the Python code must at least compile
+  # ---------------------------------------------------------------------------
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install dependencies
+        run: pip install --no-cache-dir -r app/requirements.txt
+      - name: Check that app.py compiles
+        run: python -m py_compile app/app.py
+
+  # ---------------------------------------------------------------------------
+  # 2. sast: Semgrep reads the source code and looks for dangerous patterns
+  #    --error => exit code 1 if something is found (this blocks the pipeline)
+  # ---------------------------------------------------------------------------
+  sast:
+    runs-on: ubuntu-latest
+    container: semgrep/semgrep:latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Semgrep scan
+        run: >
+          semgrep scan
+          --config p/python
+          --config p/flask
+          --severity ERROR
+          --error
+          --metrics=off
+          app/
+
+  # ---------------------------------------------------------------------------
+  # 3. secrets: Gitleaks looks for leaked passwords/keys/tokens
+  #    fetch-depth 0 = download the FULL git history (old commits too)
+  #    --config = default rules + our custom "hardcoded credential" rule
+  #    --redact = the secret value is never printed in the log
+  # ---------------------------------------------------------------------------
+  secrets:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Gitleaks scan
+        run: |
+          docker run --rm -v "$PWD:/repo" --entrypoint sh zricethezav/gitleaks:v8.21.2 -c \
+            "git config --global --add safe.directory /repo && gitleaks detect --source /repo --config /repo/.gitleaks.toml --redact --verbose --exit-code 1"
+
+  # ---------------------------------------------------------------------------
+  # 4. dependencies: Trivy checks requirements.txt against public CVE databases
+  #    --ignore-unfixed => only vulnerabilities that have a fix available
+  #    --exit-code 1    => fail on CRITICAL / HIGH findings
+  # ---------------------------------------------------------------------------
+  dependencies:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Trivy filesystem scan
+        run: |
+          docker run --rm -v "$PWD:/repo" aquasec/trivy:0.58.1 fs \
+            --scanners vuln --severity CRITICAL,HIGH --ignore-unfixed \
+            --exit-code 1 --no-progress /repo/app
+
+  # ---------------------------------------------------------------------------
+  # 5. build: build the image from the EXISTING app/Dockerfile and push it to
+  #    GitHub Container Registry (ghcr.io). Runs only if all checks are green.
+  # ---------------------------------------------------------------------------
+  build:
+    needs: [test, sast, secrets, dependencies]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set image name (must be lowercase)
+        run: echo "IMAGE=ghcr.io/${GITHUB_REPOSITORY,,}/helpdesk-app:${GITHUB_SHA}" >> "$GITHUB_ENV"
+      - name: Log in to ghcr.io
+        run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+      - name: Build image
+        run: docker build -f app/Dockerfile -t "$IMAGE" app/
+      - name: Push image
+        run: docker push "$IMAGE"
+
+  # ---------------------------------------------------------------------------
+  # 6. image-scan: Trivy scans the image we just built and pushed
+  #    Same policy as "dependencies".
+  # ---------------------------------------------------------------------------
+  image-scan:
+    needs: [build]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: read
+    steps:
+      - name: Set image name (must be lowercase)
+        run: echo "IMAGE=ghcr.io/${GITHUB_REPOSITORY,,}/helpdesk-app:${GITHUB_SHA}" >> "$GITHUB_ENV"
+      - name: Log in to ghcr.io
+        run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+      - name: Pull image
+        run: docker pull "$IMAGE"
+      - name: Trivy image scan
+        run: |
+          docker run --rm -v /var/run/docker.sock:/var/run/docker.sock aquasec/trivy:0.58.1 image \
+            --severity CRITICAL,HIGH --ignore-unfixed --exit-code 1 --no-progress "$IMAGE"
