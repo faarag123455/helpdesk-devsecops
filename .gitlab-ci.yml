@@ -1,0 +1,180 @@
+# =============================================================================
+# HelpDesk DevSecOps - CI/CD pipeline (TEK-UP, ING-5-SSIRF-B)
+# Owner: Farah Chebbi
+#
+# HOW THE PIPELINE IS ORGANISED
+# -----------------------------------------------------------------------------
+#   test, sast, secrets, dependencies   -> start immediately, in parallel
+#   build        -> starts ONLY if test + sast + secrets + dependencies passed
+#   image-scan   -> starts ONLY if build passed
+# Running the scanners in parallel means each one shows its own result (green
+# or red) even if another one fails. The gate stays strict: nothing is built
+# or pushed to the registry unless ALL checks are green.
+#
+# BLOCKING POLICY (what makes the pipeline fail, and why)
+# -----------------------------------------------------------------------------
+# 1. sast         : fails if Semgrep finds any ERROR-level finding in app/.
+#                   Why: ERROR = dangerous code patterns (injection, unsafe
+#                   deserialization...) that must not reach production.
+# 2. secrets      : fails if Gitleaks finds ANY secret in the repo or in its
+#                   full git history. The secret value is never printed
+#                   (--redact), only the rule, file and line.
+#                   Why: a leaked secret must be revoked, not tolerated.
+# 3. dependencies : fails if Trivy finds a CRITICAL or HIGH vulnerability
+#                   WITH an available fix in requirements.txt.
+#                   Why: if a fix exists, there is no excuse to keep the risk.
+# 4. image-scan   : same policy as "dependencies", applied to the final Docker
+#                   image (OS packages + Python libraries inside the image).
+# Stages "test" and "build" also stop the pipeline if they fail.
+# The deploy / DAST stages will be added later by the team.
+# =============================================================================
+
+stages:
+  - test
+  - sast
+  - secrets
+  - dependencies
+  - build
+  - image-scan
+
+variables:
+  # One single image name, used by build AND image-scan (and by the Kubernetes
+  # manifests). Tag = full commit SHA, so every image is traceable to a commit.
+  IMAGE: "$CI_REGISTRY_IMAGE/helpdesk-app:$CI_COMMIT_SHA"
+
+# -----------------------------------------------------------------------------
+# Stage 1 - test: basic sanity check, the Python code must at least compile.
+# -----------------------------------------------------------------------------
+test:
+  stage: test
+  needs: []
+  image: python:3.11
+  script:
+    - pip install --no-cache-dir -r app/requirements.txt
+    - python -m py_compile app/app.py
+    - echo "app.py compiles correctly"
+
+# -----------------------------------------------------------------------------
+# Stage 2 - sast: Static Application Security Testing with Semgrep.
+# Reads the source code WITHOUT running it and looks for dangerous patterns.
+# --error      => exit code 1 if something is found (this blocks the pipeline)
+# --severity   => only ERROR-level findings count
+# -----------------------------------------------------------------------------
+sast:
+  stage: sast
+  needs: []
+  image: semgrep/semgrep:latest
+  allow_failure: false
+  script:
+    - >
+      semgrep scan
+      --config p/python
+      --config p/flask
+      --severity ERROR
+      --error
+      --metrics=off
+      --json-output semgrep-report.json
+      app/
+  artifacts:
+    when: always
+    expire_in: 1 week
+    paths:
+      - semgrep-report.json
+
+# -----------------------------------------------------------------------------
+# Stage 3 - secrets: Gitleaks looks for leaked passwords/keys/tokens.
+# - GIT_DEPTH 0 = fetch the FULL git history (not only the last commits),
+#   because a secret deleted today can still live in an old commit.
+# - --config .gitleaks.toml = default rules + our "hardcoded credential" rule.
+# - --redact = the secret value is NEVER printed in the job log.
+# - If a file .gitleaks-baseline.json exists, findings already known and
+#   rotated (old history) are ignored; any NEW secret still fails the job.
+# -----------------------------------------------------------------------------
+secrets:
+  stage: secrets
+  needs: []
+  image:
+    name: zricethezav/gitleaks:v8.21.2
+    entrypoint: [""]
+  variables:
+    GIT_DEPTH: "0"
+  allow_failure: false
+  script:
+    - git config --global --add safe.directory "$CI_PROJECT_DIR"
+    - |
+      BASELINE=""
+      if [ -f .gitleaks-baseline.json ]; then BASELINE="--baseline-path .gitleaks-baseline.json"; fi
+      gitleaks detect --source . --config .gitleaks.toml $BASELINE --redact --verbose --exit-code 1 --report-format json --report-path gitleaks-report.json
+  artifacts:
+    when: always
+    expire_in: 1 week
+    paths:
+      - gitleaks-report.json
+
+# -----------------------------------------------------------------------------
+# Stage 4 - dependencies: Trivy checks the pinned libraries in
+# requirements.txt against public vulnerability databases (CVE).
+# --ignore-unfixed => only report vulnerabilities that have a fix available
+# --exit-code 1    => fail the pipeline on CRITICAL / HIGH findings
+# -----------------------------------------------------------------------------
+dependencies:
+  stage: dependencies
+  needs: []
+  image:
+    name: aquasec/trivy:0.58.1
+    entrypoint: [""]
+  allow_failure: false
+  script:
+    - >
+      trivy fs
+      --scanners vuln
+      --severity CRITICAL,HIGH
+      --ignore-unfixed
+      --exit-code 1
+      --no-progress
+      app/
+
+# -----------------------------------------------------------------------------
+# Stage 5 - build: build the Docker image from the EXISTING app/Dockerfile
+# (build context = app/) and push it to the GitLab Container Registry.
+# Runs only when test, sast, secrets and dependencies are all green.
+# $CI_REGISTRY_USER / $CI_REGISTRY_PASSWORD are provided automatically by GitLab.
+# docker:24-dind is a Docker daemon running as a service next to the job.
+# -----------------------------------------------------------------------------
+build:
+  stage: build
+  needs: [test, sast, secrets, dependencies]
+  image: docker:24
+  services:
+    - docker:24-dind
+  variables:
+    DOCKER_TLS_CERTDIR: "/certs"
+  script:
+    - echo "$CI_REGISTRY_PASSWORD" | docker login -u "$CI_REGISTRY_USER" --password-stdin "$CI_REGISTRY"
+    - docker build -f app/Dockerfile -t "$IMAGE" app/
+    - docker push "$IMAGE"
+    - echo "Pushed $IMAGE"
+
+# -----------------------------------------------------------------------------
+# Stage 6 - image-scan: Trivy scans the image we just built and pushed
+# (OS packages + Python libraries inside it). Same policy as "dependencies".
+# TRIVY_USERNAME / TRIVY_PASSWORD let Trivy pull from our private registry.
+# -----------------------------------------------------------------------------
+image-scan:
+  stage: image-scan
+  needs: [build]
+  image:
+    name: aquasec/trivy:0.58.1
+    entrypoint: [""]
+  variables:
+    TRIVY_USERNAME: "$CI_REGISTRY_USER"
+    TRIVY_PASSWORD: "$CI_REGISTRY_PASSWORD"
+  allow_failure: false
+  script:
+    - >
+      trivy image
+      --severity CRITICAL,HIGH
+      --ignore-unfixed
+      --exit-code 1
+      --no-progress
+      "$IMAGE"

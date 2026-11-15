@@ -1,0 +1,386 @@
+# =============================================================================
+# HelpDesk DevSecOps - CI/CD security pipeline (GitHub Actions) - version 5
+# TEK-UP, ING-5-SSIRF-B - Owner: Farah Chebbi
+#
+# NEW IN V2: every scanner now saves a JSON report as a downloadable artifact
+# (even when the job fails). These reports are the input for the next steps:
+# security score + badge, and the AI security reviewer.
+#
+# NEW IN V5: a new "exploit-tests" job starts the real HelpDesk app (Docker
+# Compose) and runs security-tests/run_tests.py, which performs the actual
+# attack for each VULN-x and reports "exploitable" or "blocked". This is the
+# "Security Proof": before fixes, everything should be exploitable; after
+# Firas's fixes, everything should be blocked. It never blocks the pipeline
+# by itself (see the EXPLOIT_TESTS_BLOCKING policy inside the job).
+#
+# NEW IN V4: the summary is also posted as a comment on the Pull Request.
+# NEW IN V3: a "security-summary" job shows a table + a security score
+# for every run (read from the 3 JSON reports), and saves it as an artifact.
+#
+# HOW IT WORKS
+#   test, sast, secrets, dependencies -> start immediately, in parallel
+#   build       -> starts ONLY if all four jobs above passed
+#   image-scan  -> starts ONLY if build passed
+#
+# BLOCKING POLICY (what makes the pipeline fail, and why)
+#   sast         : Semgrep finds an ERROR-level finding in app/
+#   secrets      : Gitleaks finds a secret in the repo or in its full git history
+#                  (value hidden with --redact, only file/rule/line are shown)
+#   dependencies : Trivy finds a CRITICAL/HIGH vulnerability WITH a fix available
+#   image-scan   : same policy as "dependencies", applied to the Docker image
+# =============================================================================
+
+name: HelpDesk security pipeline
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:   # lets you start it by hand from the Actions tab
+
+permissions:
+  contents: read
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # 1. test: the Python code must at least compile
+  # ---------------------------------------------------------------------------
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install dependencies
+        run: pip install --no-cache-dir -r app/requirements.txt
+      - name: Check that app.py compiles
+        run: python -m py_compile app/app.py
+
+  # ---------------------------------------------------------------------------
+  # 2. sast: Semgrep reads the source code and looks for dangerous patterns
+  #    --error       => exit code 1 if something is found (blocks the pipeline)
+  #    --json-output => also saves a machine-readable report
+  # ---------------------------------------------------------------------------
+  sast:
+    runs-on: ubuntu-latest
+    container: semgrep/semgrep:latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Semgrep scan
+        run: >
+          semgrep scan
+          --config p/python
+          --config p/flask
+          --severity ERROR
+          --error
+          --metrics=off
+          --json-output semgrep-report.json
+          app/
+      - name: Save Semgrep report
+        if: always()   # keep the report even when the scan failed
+        uses: actions/upload-artifact@v4
+        with:
+          name: semgrep-report
+          path: semgrep-report.json
+          retention-days: 14
+
+  # ---------------------------------------------------------------------------
+  # 3. secrets: Gitleaks looks for leaked passwords/keys/tokens
+  #    fetch-depth 0 = download the FULL git history (old commits too)
+  #    --redact = the secret value is never printed in the log or the report
+  # ---------------------------------------------------------------------------
+  secrets:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Gitleaks scan
+        run: |
+          docker run --rm -v "$PWD:/repo" --entrypoint sh zricethezav/gitleaks:v8.21.2 -c \
+            "git config --global --add safe.directory /repo && gitleaks detect --source /repo --config /repo/.gitleaks.toml --redact --verbose --exit-code 1 --report-format json --report-path /repo/gitleaks-report.json"
+      - name: Save Gitleaks report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: gitleaks-report
+          path: gitleaks-report.json
+          retention-days: 14
+
+  # ---------------------------------------------------------------------------
+  # 4. dependencies: Trivy checks requirements.txt against public CVE databases
+  #    Step 1 writes the JSON report (never fails), step 2 applies the policy:
+  #    --ignore-unfixed => only vulnerabilities that have a fix available
+  #    --exit-code 1    => fail on CRITICAL / HIGH findings
+  # ---------------------------------------------------------------------------
+  dependencies:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Trivy JSON report
+        run: |
+          docker run --rm -v "$PWD:/repo" aquasec/trivy:0.58.1 fs \
+            --scanners vuln --severity CRITICAL,HIGH --ignore-unfixed \
+            --format json --output /repo/trivy-deps-report.json \
+            --exit-code 0 --no-progress /repo/app
+      - name: Save Trivy report
+        uses: actions/upload-artifact@v4
+        with:
+          name: trivy-deps-report
+          path: trivy-deps-report.json
+          retention-days: 14
+      - name: Trivy policy check (fails on CRITICAL/HIGH with a fix)
+        run: |
+          docker run --rm -v "$PWD:/repo" aquasec/trivy:0.58.1 fs \
+            --scanners vuln --severity CRITICAL,HIGH --ignore-unfixed \
+            --exit-code 1 --no-progress /repo/app
+
+  # ---------------------------------------------------------------------------
+  # 5. build: build the image from the EXISTING app/Dockerfile and push it to
+  #    GitHub Container Registry (ghcr.io). Runs only if all checks are green.
+  # ---------------------------------------------------------------------------
+  build:
+    needs: [test, sast, secrets, dependencies]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set image name (must be lowercase)
+        run: echo "IMAGE=ghcr.io/${GITHUB_REPOSITORY,,}/helpdesk-app:${GITHUB_SHA}" >> "$GITHUB_ENV"
+      - name: Log in to ghcr.io
+        run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+      - name: Build image
+        run: docker build -f app/Dockerfile -t "$IMAGE" app/
+      - name: Push image
+        run: docker push "$IMAGE"
+
+  # ---------------------------------------------------------------------------
+  # 6. image-scan: Trivy scans the image we just built and pushed
+  #    Same policy as "dependencies".
+  # ---------------------------------------------------------------------------
+  image-scan:
+    needs: [build]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: read
+    steps:
+      - name: Set image name (must be lowercase)
+        run: echo "IMAGE=ghcr.io/${GITHUB_REPOSITORY,,}/helpdesk-app:${GITHUB_SHA}" >> "$GITHUB_ENV"
+      - name: Log in to ghcr.io
+        run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+      - name: Pull image
+        run: docker pull "$IMAGE"
+      - name: Trivy image scan
+        run: |
+          docker run --rm -v /var/run/docker.sock:/var/run/docker.sock aquasec/trivy:0.58.1 image \
+            --severity CRITICAL,HIGH --ignore-unfixed --exit-code 1 --no-progress "$IMAGE"
+
+  # ---------------------------------------------------------------------------
+  # 7. security-summary: reads the 3 JSON reports and shows a summary table and
+  #    a security score on the run page. It never blocks the pipeline.
+  #    "if: always()" = runs even when the scanners failed (that is the point).
+  #    Secrets are never shown: only rule, file and line number are kept.
+  # ---------------------------------------------------------------------------
+  # ---------------------------------------------------------------------------
+  # exploit-tests ("Security Proof"): start the real app with the EXISTING
+  # docker-compose.yml and run the exploitation script against it.
+  # - allow_failure-style policy: set EXPLOIT_TESTS_BLOCKING to "true" once
+  #   the team wants the pipeline to turn red while vulnerabilities are
+  #   exploitable (for example once Firas starts applying fixes). For now it
+  #   stays "false" so this job is purely informational while the app is
+  #   still intentionally vulnerable.
+  # - needs: [] so it runs in parallel with the static scanners: it tests
+  #   the RUNNING app (dynamic), they test the SOURCE CODE (static).
+  # ---------------------------------------------------------------------------
+  exploit-tests:
+    needs: []
+    runs-on: ubuntu-latest
+    env:
+      EXPLOIT_TESTS_BLOCKING: "false"
+    steps:
+      - uses: actions/checkout@v4
+      - name: Start HelpDesk (docker compose)
+        run: docker compose -f app/docker-compose.yml up -d --build
+      - name: Wait for Postgres and apply schema.sql
+        # docker-compose.yml does not mount schema.sql into
+        # /docker-entrypoint-initdb.d, so the database starts empty: we have
+        # to create the tables ourselves before the app can register/login.
+        run: |
+          for i in $(seq 1 30); do
+            if docker compose -f app/docker-compose.yml exec -T postgres pg_isready -U helpdesk -d helpdesk; then
+              break
+            fi
+            sleep 2
+          done
+          docker compose -f app/docker-compose.yml exec -T postgres \
+            psql -U helpdesk -d helpdesk < app/schema.sql
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install test dependencies
+        run: pip install --no-cache-dir -r security-tests/requirements.txt
+      - name: Run exploitation tests
+        id: run
+        working-directory: security-tests
+        env:
+          APP_URL: http://127.0.0.1:5000
+        run: |
+          python run_tests.py
+          exploitable=$(python -c "import json;print(json.load(open('exploit-report.json'))['exploitable'])")
+          echo "exploitable=$exploitable" >> "$GITHUB_OUTPUT"
+      - name: Show app logs (useful if the app never became ready)
+        if: always()
+        run: docker compose -f app/docker-compose.yml logs --no-color || true
+      - name: Stop HelpDesk
+        if: always()
+        run: docker compose -f app/docker-compose.yml down -v
+      - name: Save exploitation report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: exploit-report
+          path: |
+            security-tests/exploit-report.json
+            security-tests/exploit-report.md
+          retention-days: 14
+      - name: Apply blocking policy
+        if: env.EXPLOIT_TESTS_BLOCKING == 'true' && steps.run.outputs.exploitable != '0'
+        run: |
+          echo "::error::${{ steps.run.outputs.exploitable }} vulnerabilities are still exploitable, and EXPLOIT_TESTS_BLOCKING=true."
+          exit 1
+
+  security-summary:
+    needs: [sast, secrets, dependencies]
+    if: always()
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: write   # needed to post the comment on the Pull Request
+    steps:
+      - name: Download scan reports
+        uses: actions/download-artifact@v4
+        with:
+          pattern: "*-report"
+          path: reports
+          merge-multiple: true
+      - name: Build summary and score
+        run: |
+          python3 - <<'PY'
+          import json, os, collections
+
+          def load(name):
+              path = os.path.join("reports", name)
+              if not os.path.exists(path):
+                  return None
+              try:
+                  with open(path, encoding="utf-8") as f:
+                      return json.load(f)
+              except Exception:
+                  return None
+
+          semgrep = load("semgrep-report.json")
+          leaks = load("gitleaks-report.json")
+          trivy = load("trivy-deps-report.json")
+
+          # Semgrep (SAST): count findings by severity
+          sem = collections.Counter()
+          for r in (semgrep or {}).get("results", []):
+              sem[r.get("extra", {}).get("severity", "UNKNOWN")] += 1
+
+          # Gitleaks (secrets): keep ONLY rule, file and line (never the value)
+          leak_rows = []
+          if isinstance(leaks, list):
+              for x in leaks:
+                  leak_rows.append((x.get("RuleID", ""), x.get("File", ""), x.get("StartLine", "")))
+          leak_files = collections.Counter(f for _, f, _ in leak_rows)
+
+          # Trivy (dependencies): vulnerable libraries
+          tv = collections.Counter()
+          tv_rows = []
+          for res in (trivy or {}).get("Results", []) or []:
+              for v in res.get("Vulnerabilities", []) or []:
+                  tv[v.get("Severity", "UNKNOWN")] += 1
+                  tv_rows.append((v.get("Severity", ""), v.get("VulnerabilityID", ""),
+                                  v.get("PkgName", ""), v.get("InstalledVersion", ""),
+                                  v.get("FixedVersion", "")))
+          order = {"CRITICAL": 0, "HIGH": 1}
+          tv_rows.sort(key=lambda r: (order.get(r[0], 9), r[2], r[1]))
+
+          # Security score = 100 minus penalties (never below 0)
+          penalty = tv["CRITICAL"] * 10 + tv["HIGH"] * 5 + sem["ERROR"] * 5 + len(leak_rows) * 5
+          score = max(0, 100 - penalty)
+
+          def val(report, value):
+              return "report missing" if report is None else str(value)
+
+          md = []
+          md.append("# HelpDesk security summary")
+          md.append("")
+          md.append(f"## Security score: {score}/100")
+          md.append("")
+          md.append("Score = 100 - (10 x CRITICAL CVE) - (5 x HIGH CVE) - (5 x Semgrep ERROR) - (5 x secret found), minimum 0.")
+          md.append("")
+          md.append("| Tool | What it checks | Findings |")
+          md.append("|---|---|---|")
+          md.append(f"| Semgrep (sast) | source code | {val(semgrep, sem['ERROR'])} ERROR |")
+          md.append(f"| Gitleaks (secrets) | repo + git history | {val(leaks, len(leak_rows))} secrets |")
+          md.append(f"| Trivy (dependencies) | requirements.txt | {val(trivy, tv['CRITICAL'])} CRITICAL, {val(trivy, tv['HIGH'])} HIGH |")
+          md.append("")
+          if leak_files:
+              md.append("## Files with secrets (values are never shown)")
+              md.append("")
+              for f, c in leak_files.most_common():
+                  md.append(f"- `{f}`: {c}")
+              md.append("")
+          if tv_rows:
+              md.append("## Top vulnerable libraries (first 10)")
+              md.append("")
+              md.append("| Severity | CVE | Package | Installed | Fixed in |")
+              md.append("|---|---|---|---|---|")
+              for s, cve, pkg, inst, fix in tv_rows[:10]:
+                  md.append(f"| {s} | {cve} | {pkg} | {inst} | {fix} |")
+              md.append("")
+
+          text = "\n".join(md)
+          print(text)
+          with open("security-summary.md", "w", encoding="utf-8") as f:
+              f.write(text)
+          with open("security-summary.json", "w", encoding="utf-8") as f:
+              json.dump({"score": score, "semgrep_error": sem["ERROR"],
+                         "secrets": len(leak_rows), "cve_critical": tv["CRITICAL"],
+                         "cve_high": tv["HIGH"]}, f, indent=2)
+          summary_file = os.environ.get("GITHUB_STEP_SUMMARY")
+          if summary_file:
+              with open(summary_file, "a", encoding="utf-8") as f:
+                  f.write(text + "\n")
+          PY
+      - name: Post summary on the Pull Request
+        # Only on Pull Requests. The comment is created once, then updated at
+        # every push (the hidden marker lets us find our own comment).
+        if: github.event_name == 'pull_request'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const marker = '<!-- security-summary -->';
+            const body = marker + '\n' + fs.readFileSync('security-summary.md', 'utf8');
+            const { owner, repo } = context.repo;
+            const issue_number = context.issue.number;
+            const { data: comments } = await github.rest.issues.listComments({ owner, repo, issue_number });
+            const existing = comments.find(c => c.body && c.body.startsWith(marker));
+            if (existing) {
+              await github.rest.issues.updateComment({ owner, repo, comment_id: existing.id, body });
+            } else {
+              await github.rest.issues.createComment({ owner, repo, issue_number, body });
+            }
+      - name: Save summary
+        uses: actions/upload-artifact@v4
+        with:
+          name: security-summary
+          path: |
+            security-summary.md
+            security-summary.json
+          retention-days: 14
