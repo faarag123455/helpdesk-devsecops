@@ -1,11 +1,12 @@
 # =============================================================================
-# HelpDesk DevSecOps - CI/CD security pipeline (GitHub Actions) - version 3
+# HelpDesk DevSecOps - CI/CD security pipeline (GitHub Actions) - version 4
 # TEK-UP, ING-5-SSIRF-B - Owner: Farah Chebbi
 #
 # NEW IN V2: every scanner now saves a JSON report as a downloadable artifact
 # (even when the job fails). These reports are the input for the next steps:
 # security score + badge, and the AI security reviewer.
 #
+# NEW IN V4: the summary is also posted as a comment on the Pull Request.
 # NEW IN V3: a "security-summary" job shows a table + a security score
 # for every run (read from the 3 JSON reports), and saves it as an artifact.
 #
@@ -180,6 +181,9 @@ jobs:
     needs: [sast, secrets, dependencies]
     if: always()
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: write   # needed to post the comment on the Pull Request
     steps:
       - name: Download scan reports
         uses: actions/download-artifact@v4
@@ -278,6 +282,25 @@ jobs:
               with open(summary_file, "a", encoding="utf-8") as f:
                   f.write(text + "\n")
           PY
+      - name: Post summary on the Pull Request
+        # Only on Pull Requests. The comment is created once, then updated at
+        # every push (the hidden marker lets us find our own comment).
+        if: github.event_name == 'pull_request'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const marker = '<!-- security-summary -->';
+            const body = marker + '\n' + fs.readFileSync('security-summary.md', 'utf8');
+            const { owner, repo } = context.repo;
+            const issue_number = context.issue.number;
+            const { data: comments } = await github.rest.issues.listComments({ owner, repo, issue_number });
+            const existing = comments.find(c => c.body && c.body.startsWith(marker));
+            if (existing) {
+              await github.rest.issues.updateComment({ owner, repo, comment_id: existing.id, body });
+            } else {
+              await github.rest.issues.createComment({ owner, repo, issue_number, body });
+            }
       - name: Save summary
         uses: actions/upload-artifact@v4
         with:
