@@ -1,10 +1,17 @@
 # =============================================================================
-# HelpDesk DevSecOps - CI/CD security pipeline (GitHub Actions) - version 4
+# HelpDesk DevSecOps - CI/CD security pipeline (GitHub Actions) - version 5
 # TEK-UP, ING-5-SSIRF-B - Owner: Farah Chebbi
 #
 # NEW IN V2: every scanner now saves a JSON report as a downloadable artifact
 # (even when the job fails). These reports are the input for the next steps:
 # security score + badge, and the AI security reviewer.
+#
+# NEW IN V5: a new "exploit-tests" job starts the real HelpDesk app (Docker
+# Compose) and runs security-tests/run_tests.py, which performs the actual
+# attack for each VULN-x and reports "exploitable" or "blocked". This is the
+# "Security Proof": before fixes, everything should be exploitable; after
+# Firas's fixes, everything should be blocked. It never blocks the pipeline
+# by itself (see the EXPLOIT_TESTS_BLOCKING policy inside the job).
 #
 # NEW IN V4: the summary is also posted as a comment on the Pull Request.
 # NEW IN V3: a "security-summary" job shows a table + a security score
@@ -177,6 +184,61 @@ jobs:
   #    "if: always()" = runs even when the scanners failed (that is the point).
   #    Secrets are never shown: only rule, file and line number are kept.
   # ---------------------------------------------------------------------------
+  # ---------------------------------------------------------------------------
+  # exploit-tests ("Security Proof"): start the real app with the EXISTING
+  # docker-compose.yml and run the exploitation script against it.
+  # - allow_failure-style policy: set EXPLOIT_TESTS_BLOCKING to "true" once
+  #   the team wants the pipeline to turn red while vulnerabilities are
+  #   exploitable (for example once Firas starts applying fixes). For now it
+  #   stays "false" so this job is purely informational while the app is
+  #   still intentionally vulnerable.
+  # - needs: [] so it runs in parallel with the static scanners: it tests
+  #   the RUNNING app (dynamic), they test the SOURCE CODE (static).
+  # ---------------------------------------------------------------------------
+  exploit-tests:
+    needs: []
+    runs-on: ubuntu-latest
+    env:
+      EXPLOIT_TESTS_BLOCKING: "false"
+    steps:
+      - uses: actions/checkout@v4
+      - name: Start HelpDesk (docker compose)
+        run: docker compose -f app/docker-compose.yml up -d --build
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install test dependencies
+        run: pip install --no-cache-dir -r security-tests/requirements.txt
+      - name: Run exploitation tests
+        id: run
+        working-directory: security-tests
+        env:
+          APP_URL: http://127.0.0.1:5000
+        run: |
+          python run_tests.py
+          exploitable=$(python -c "import json;print(json.load(open('exploit-report.json'))['exploitable'])")
+          echo "exploitable=$exploitable" >> "$GITHUB_OUTPUT"
+      - name: Show app logs (useful if the app never became ready)
+        if: always()
+        run: docker compose -f app/docker-compose.yml logs --no-color || true
+      - name: Stop HelpDesk
+        if: always()
+        run: docker compose -f app/docker-compose.yml down -v
+      - name: Save exploitation report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: exploit-report
+          path: |
+            security-tests/exploit-report.json
+            security-tests/exploit-report.md
+          retention-days: 14
+      - name: Apply blocking policy
+        if: env.EXPLOIT_TESTS_BLOCKING == 'true' && steps.run.outputs.exploitable != '0'
+        run: |
+          echo "::error::${{ steps.run.outputs.exploitable }} vulnerabilities are still exploitable, and EXPLOIT_TESTS_BLOCKING=true."
+          exit 1
+
   security-summary:
     needs: [sast, secrets, dependencies]
     if: always()
