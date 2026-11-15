@@ -204,6 +204,19 @@ jobs:
       - uses: actions/checkout@v4
       - name: Start HelpDesk (docker compose)
         run: docker compose -f app/docker-compose.yml up -d --build
+      - name: Wait for Postgres and apply schema.sql
+        # docker-compose.yml does not mount schema.sql into
+        # /docker-entrypoint-initdb.d, so the database starts empty: we have
+        # to create the tables ourselves before the app can register/login.
+        run: |
+          for i in $(seq 1 30); do
+            if docker compose -f app/docker-compose.yml exec -T postgres pg_isready -U helpdesk -d helpdesk; then
+              break
+            fi
+            sleep 2
+          done
+          docker compose -f app/docker-compose.yml exec -T postgres \
+            psql -U helpdesk -d helpdesk < app/schema.sql
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
